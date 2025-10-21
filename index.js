@@ -44,21 +44,32 @@ app.post('/ocr', upload.single('file'), async (req, res) => {
       return res.status(400).json({ success: false, error: 'No file uploaded' });
     }
 
-    console.log(`[OCR] Processing file: ${req.file.originalname}`);
+    console.log(`[OCR] Processing file: ${req.file.originalname} (${req.file.mimetype})`);
 
     const filePath = req.file.path;
+
+    // Check if file is PDF - Tesseract.js cannot handle PDFs
+    if (req.file.mimetype === 'application/pdf') {
+      fs.unlinkSync(filePath);
+      return res.status(400).json({
+        success: false,
+        error: 'PDF files not supported. Please send JPG or PNG instead.'
+      });
+    }
 
     // Run Tesseract.js
     const { data: { text } } = await Tesseract.recognize(
       filePath,
       'eng',
       {
-        logger: (m) => console.log('[Tesseract]', m)
+        logger: (m) => console.log('[Tesseract]', m.progress || m.status)
       }
     );
 
     // Clean up uploaded file
-    fs.unlinkSync(filePath);
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
 
     if (!text || text.trim().length === 0) {
       return res.json({
@@ -82,7 +93,11 @@ app.post('/ocr', upload.single('file'), async (req, res) => {
 
     // Clean up file if it exists
     if (req.file && fs.existsSync(req.file.path)) {
-      fs.unlinkSync(req.file.path);
+      try {
+        fs.unlinkSync(req.file.path);
+      } catch (e) {
+        console.error('[Cleanup Error]', e.message);
+      }
     }
 
     res.status(500).json({
