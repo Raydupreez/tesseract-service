@@ -4,6 +4,8 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 const Tesseract = require('tesseract.js');
+const { execSync } = require('child_process');
+const pdfParse = require('pdf-parse');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -30,75 +32,110 @@ const upload = multer({
  * Health check endpoint
  */
 app.get('/health', (req, res) => {
-  res.json({ status: 'healthy', service: 'tesseract-ocr' });
+  res.json({ 
+    status: 'healthy', 
+    service: 'tesseract-ocr',
+    features: ['ocr', 'pdf-support', 'page-extraction']
+  });
 });
 
 /**
- * Main OCR endpoint
+ * Main OCR endpoint - Supports PDFs with page extraction
  * POST /ocr
- * Body: { file: <binary> }
+ * Multipart form:
+ *   - file: <binary PDF/JPG/PNG>
+ *   - page: <optional page number for PDFs>
  */
 app.post('/ocr', upload.single('file'), async (req, res) => {
+  let filePath = null;
+  let tempImagePath = null;
+
   try {
     if (!req.file) {
       return res.status(400).json({ success: false, error: 'No file uploaded' });
     }
 
-    console.log(`[OCR] Processing file: ${req.file.originalname} (${req.file.mimetype})`);
+    filePath = req.file.path;
+    const pageNumber = req.body.page ? parseInt(req.body.page) : null;
 
-    const filePath = req.file.path;
+    console.log(`[OCR] Processing file: ${req.file.originalname}`);
+    console.log(`[OCR] MIME type: ${req.file.mimetype}`);
+    console.log(`[OCR] Page requested: ${pageNumber || 'all'}`);
 
-    // Check if file is PDF - Tesseract.js cannot handle PDFs
+    let imagePathToOcr = filePath;
+    let pdfPageCount = null;
+    let processedPage = null;
+
+    // Handle PDF files
     if (req.file.mimetype === 'application/pdf') {
-      fs.unlinkSync(filePath);
-      return res.status(400).json({
-        success: false,
-        error: 'PDF files not supported. Please send JPG or PNG instead.'
-      });
+      console.log(`[PDF] Converting PDF to image for OCR...`);
+      
+      try {
+        const result = await convertPdfPageToImage(filePath, pageNumber);
+        tempImagePath = result.imagePath;
+        pdfPageCount = result.totalPages;
+        processedPage = result.pageNumber;
+        imagePathToOcr = tempImagePath;
+        
+        console.log(`[PDF] ✓ Successfully converted page ${processedPage} of ${pdfPageCount}`);
+      } catch (pdfError) {
+        console.error('[PDF Error]', pdfError.message);
+        cleanupFiles(filePath, null);
+        return res.status(400).json({
+          success: false,
+          error: 'Failed to process PDF: ' + pdfError.message
+        });
+      }
     }
 
-    // Run Tesseract.js
+    // Run Tesseract.js on the image
+    console.log(`[Tesseract] Processing image: ${path.basename(imagePathToOcr)}`);
+    
     const { data: { text } } = await Tesseract.recognize(
-      filePath,
+      imagePathToOcr,
       'eng',
       {
-        logger: (m) => console.log('[Tesseract]', m.progress || m.status)
+        logger: (m) => {
+          if (m.status === 'recognizing text') {
+            console.log(`[Tesseract] Progress: ${Math.round(m.progress * 100)}%`);
+          }
+        }
       }
     );
 
-    // Clean up uploaded file
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-    }
-
     if (!text || text.trim().length === 0) {
+      console.log('[OCR] No text detected');
+      cleanupFiles(filePath, tempImagePath);
+      
       return res.json({
         success: true,
         text: '',
-        warning: 'No text detected in document'
+        length: 0,
+        warning: 'No text detected in document',
+        page_processed: processedPage,
+        total_pages: pdfPageCount
       });
     }
 
-    console.log(`[OCR] Successfully extracted ${text.length} characters`);
+    console.log(`[OCR] ✓ Successfully extracted ${text.length} characters`);
+
+    // Clean up
+    cleanupFiles(filePath, tempImagePath);
 
     res.json({
       success: true,
       text: text,
       length: text.length,
-      confidence: calculateConfidence(text)
+      confidence: calculateConfidence(text),
+      page_processed: processedPage,
+      total_pages: pdfPageCount
     });
 
   } catch (error) {
     console.error('[OCR Error]', error.message);
+    console.error(error.stack);
 
-    // Clean up file if it exists
-    if (req.file && fs.existsSync(req.file.path)) {
-      try {
-        fs.unlinkSync(req.file.path);
-      } catch (e) {
-        console.error('[Cleanup Error]', e.message);
-      }
-    }
+    cleanupFiles(filePath, tempImagePath);
 
     res.status(500).json({
       success: false,
@@ -108,26 +145,112 @@ app.post('/ocr', upload.single('file'), async (req, res) => {
 });
 
 /**
+ * Convert PDF page to PNG image for OCR processing
+ * Uses ghostscript (must be installed on server)
+ * 
+ * @param {string} pdfPath - Path to PDF file
+ * @param {number|null} pageNumber - Specific page to convert (1-indexed), null for first page
+ * @returns {object} - { imagePath, pageNumber, totalPages }
+ */
+async function convertPdfPageToImage(pdfPath, pageNumber = null) {
+  try {
+    // First, get total page count
+    const pdfBuffer = fs.readFileSync(pdfPath);
+    const pdfData = await pdfParse(pdfBuffer);
+    const totalPages = pdfData.numpages || 1;
+
+    console.log(`[PDF] Total pages: ${totalPages}`);
+
+    // Determine which page to process
+    let pageToProcess = pageNumber || 1;
+    if (pageToProcess < 1 || pageToProcess > totalPages) {
+      throw new Error(`Invalid page number: ${pageToProcess}. PDF has ${totalPages} pages.`);
+    }
+
+    // Generate output path
+    const outputFile = `/tmp/uploads/pdf-page-${Date.now()}.png`;
+    
+    // Build ghostscript command
+    // gs -q -dNOPAUSE -dBATCH -sDEVICE=png16m -dGraphicsAlphaBits=4 -r150 -dFirstPage=X -dLastPage=X -sOutputFile=OUTPUT INPUT.pdf
+    const cmd = `gs -q -dNOPAUSE -dBATCH -sDEVICE=png16m -dGraphicsAlphaBits=4 -r150 -dFirstPage=${pageToProcess} -dLastPage=${pageToProcess} -sOutputFile="${outputFile}" "${pdfPath}"`;
+    
+    console.log(`[GS] Running: ${cmd}`);
+    
+    const output = execSync(cmd, { encoding: 'utf8' });
+    console.log(`[GS] Output: ${output}`);
+
+    // Check if image was created
+    if (!fs.existsSync(outputFile) || fs.statSync(outputFile).size === 0) {
+      throw new Error('Ghostscript failed to generate image');
+    }
+
+    console.log(`[GS] Generated image: ${outputFile} (${fs.statSync(outputFile).size} bytes)`);
+
+    return {
+      imagePath: outputFile,
+      pageNumber: pageToProcess,
+      totalPages: totalPages
+    };
+
+  } catch (error) {
+    console.error('[PDF Conversion Error]', error.message);
+    
+    // Check if ghostscript is installed
+    try {
+      execSync('which gs', { encoding: 'utf8' });
+    } catch (e) {
+      throw new Error('Ghostscript not installed on server. Please install with: apt-get install ghostscript');
+    }
+    
+    throw error;
+  }
+}
+
+/**
+ * Clean up temporary files
+ */
+function cleanupFiles(filePath, tempImagePath) {
+  if (filePath && fs.existsSync(filePath)) {
+    try {
+      fs.unlinkSync(filePath);
+      console.log(`[Cleanup] Deleted: ${filePath}`);
+    } catch (e) {
+      console.error('[Cleanup Error]', e.message);
+    }
+  }
+  
+  if (tempImagePath && fs.existsSync(tempImagePath)) {
+    try {
+      fs.unlinkSync(tempImagePath);
+      console.log(`[Cleanup] Deleted: ${tempImagePath}`);
+    } catch (e) {
+      console.error('[Cleanup Error]', e.message);
+    }
+  }
+}
+
+/**
  * Quick confidence estimation based on text quality
  */
 function calculateConfidence(text) {
   if (!text) return 0;
 
-  // Simple heuristics:
-  // - More text = higher confidence
-  // - Fewer special chars = better
-  // - Presence of common words = better
+  // Base score on text length
+  let score = Math.min(100, (text.length / 50));
 
-  let score = Math.min(100, (text.length / 100) * 10); // Base on length
+  // Penalize for too many special characters (OCR noise)
+  const specialCharRatio = (text.match(/[^a-zA-Z0-9\s@.,-]/g) || []).length / (text.length || 1);
+  score -= specialCharRatio * 30;
 
-  // Adjust for special characters (OCR errors often produce many symbols)
-  const specialCharRatio = (text.match(/[^a-zA-Z0-9\s@.,-]/g) || []).length / text.length;
-  score -= specialCharRatio * 20;
-
-  // Bonus if common words detected
-  const commonWords = ['the', 'and', 'member', 'application', 'name', 'email', 'address'];
-  const foundWords = commonWords.filter(word => text.toLowerCase().includes(word)).length;
-  score += (foundWords * 5);
+  // Bonus for common words found
+  const commonWords = [
+    'the', 'and', 'member', 'application', 'name', 'email', 
+    'address', 'phone', 'date', 'signature', 'form', 'employer'
+  ];
+  const foundWords = commonWords.filter(word => 
+    text.toLowerCase().includes(word)
+  ).length;
+  score += (foundWords * 3);
 
   return Math.max(0, Math.min(100, Math.round(score)));
 }
@@ -155,6 +278,6 @@ app.use((req, res) => {
 
 app.listen(PORT, () => {
   console.log(`🚀 Tesseract OCR Service running on port ${PORT}`);
-  console.log(`📝 POST /ocr - Upload file for OCR processing`);
+  console.log(`📝 POST /ocr - Upload PDF/JPG/PNG for OCR processing`);
   console.log(`💚 GET /health - Health check`);
 });
